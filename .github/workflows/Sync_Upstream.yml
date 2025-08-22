@@ -1,0 +1,319 @@
+name: Auto Sync Upstream
+
+concurrency:
+  group: auto-sync-${{ github.repository }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: '00 17 * * *'   
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      SYNC_DEPTH: '0'
+      TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+      MAX_ATTEMPTS: 6
+      RETRY_BASE: 2
+      PROTECTED_FILES: |
+        .github/workflows/Sync_Upstream.yml
+
+    steps:
+      # 0. 使用 GitHub App 的 pem 生成安装 token
+      - name: Create GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      # 1. 获取上游仓库与分支信息（优先 UPSTREAM_REPO）
+      - name: Get upstream info
+        id: upstream-info
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const raw = (process.env.UPSTREAM_REPO || "").trim().replace(/\/+$/g, "");
+            const m = raw.match(/^(?:https?:\/\/github\.com\/)?([^\/]+)\/([^\/]+?)(?:\.git)?$/i);
+            if (m) {
+              core.setOutput("upstream", `https://github.com/${m[1]}/${m[2]}`);
+              core.setOutput("upstream_branch", "");
+              return;
+            }
+            try {
+              const r = await github.rest.repos.get(context.repo);
+              if (r.data && r.data.parent) {
+                core.setOutput("upstream", `https://github.com/${r.data.parent.full_name}`);
+                core.setOutput("upstream_branch", r.data.parent.default_branch || "");
+                return;
+              }
+            } catch (e) {}
+            core.setOutput("upstream", "");
+            core.setOutput("upstream_branch", "");
+
+      # 1.5 如果没有上游则退出
+      - name: Exit if no upstream
+        if: ${{ steps.upstream-info.outputs.upstream == '' }}
+        run: |
+          echo "::notice::⏹️ 无上游配置 — 退出（未设置 UPSTREAM_REPO 且非 fork）"
+          exit 0
+
+      # 2. 初始化仓库 & 配置 Git
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: ${{ env.SYNC_DEPTH }}
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "Auto Sync Bot"
+          git config user.email "auto-sync-bot@users.noreply.github.com"
+
+          UPSTREAM_URL="${{ steps.upstream-info.outputs.upstream }}"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_URL"
+          else
+            git remote add upstream "$UPSTREAM_URL"
+          fi
+
+      # 2.5 准备受保护文件列表
+      - name: Prepare protected files list
+        id: prepare-protected
+        run: |
+          set -euo pipefail
+          protected_file="${RUNNER_TEMP:-/tmp}/sync_upstream_protected_files"
+          mkdir -p "$(dirname "$protected_file")"
+          printf '%s\n' "${PROTECTED_FILES}" \
+            | tr -d '\r' \
+            | sed -E 's#^\./##; s/[[:space:]]*$//; s/^[[:space:]]*//; /^$/d' \
+            | sort -u > "$protected_file"
+          echo "PROTECTED_LIST_FILE=${protected_file}" >> $GITHUB_ENV
+
+      # 3. 检查上游是否有更新（仅保留关键文件以外的变更才同步）
+      - name: Check for upstream changes
+        id: changes
+        run: |
+          set -euo pipefail
+          trap 'rc=$?; echo "::error::Check step failed (exit $rc) at line $LINENO";
+                echo "### 中断：检查上游时出错" >> $GITHUB_STEP_SUMMARY || true;
+                echo "**上游分支**: ${UPSTREAM_BRANCH:-unknown}" >> $GITHUB_STEP_SUMMARY || true;
+                echo "**上游领先提交数**: ${UPSTREAM_AHEAD_COUNT:-unknown}" >> $GITHUB_STEP_SUMMARY || true;
+                exit $rc' ERR
+
+          UPSTREAM_BRANCH="${{ steps.upstream-info.outputs.upstream_branch }}"
+
+          if [ -z "${UPSTREAM_BRANCH}" ]; then
+            UPSTREAM_BRANCH=$(git ls-remote --symref upstream HEAD 2>/dev/null | awk '/^ref:/{print $2}' | sed 's#refs/heads/##' | head -n1 || true)
+            if [ -z "${UPSTREAM_BRANCH}" ]; then
+              for b in main master; do
+                if git ls-remote --exit-code --heads upstream ${b} >/dev/null 2>&1; then
+                  UPSTREAM_BRANCH=${b}
+                  break
+                fi
+              done
+            fi
+            UPSTREAM_BRANCH=${UPSTREAM_BRANCH:-main}
+          fi
+
+          echo "::notice::🔍 上游分支: ${UPSTREAM_BRANCH}"
+
+          if [ "${SYNC_DEPTH}" = "0" ]; then
+            git fetch --prune upstream "${UPSTREAM_BRANCH}" || { echo "::error::git fetch failed"; exit 1; }
+          else
+            git fetch --prune --depth=${SYNC_DEPTH} upstream "${UPSTREAM_BRANCH}" || { echo "::error::git fetch failed"; exit 1; }
+          fi
+
+          UPSTREAM_AHEAD_COUNT=$(git rev-list --count HEAD..upstream/"${UPSTREAM_BRANCH}" || true)
+          if [ "${SYNC_DEPTH}" = "0" ]; then
+           echo "::notice::🔍 上游领先提交数: ${UPSTREAM_AHEAD_COUNT}"
+          fi
+
+          if [ -z "${UPSTREAM_AHEAD_COUNT}" ] || [ "${UPSTREAM_AHEAD_COUNT}" -eq 0 ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "upstream_branch=${UPSTREAM_BRANCH}" >> $GITHUB_OUTPUT
+            echo "upstream_ahead_count=0" >> $GITHUB_OUTPUT
+            echo "::notice::✅ 无上游变更 — 跳过同步"
+            exit 0
+          fi
+
+          TMP_CHANGED="${RUNNER_TEMP:-/tmp}/sync_upstream_changed"
+          rm -f "$TMP_CHANGED"
+
+          git diff -z --name-only HEAD..upstream/"${UPSTREAM_BRANCH}" | grep -z -x -F -v -f "${PROTECTED_LIST_FILE}" > "$TMP_CHANGED" || true
+
+          if [ ! -s "$TMP_CHANGED" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "upstream_branch=${UPSTREAM_BRANCH}" >> $GITHUB_OUTPUT
+            echo "upstream_ahead_count=${UPSTREAM_AHEAD_COUNT}" >> $GITHUB_OUTPUT
+            echo "::notice::✅ 更新仅限受保护文件 — 跳过同步"
+            exit 0
+          fi
+
+          FILTERED_COUNT=$(tr '\0' '\n' < "$TMP_CHANGED" | sed '/^$/d' | wc -l | tr -d ' ')
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "upstream_branch=${UPSTREAM_BRANCH}" >> $GITHUB_OUTPUT
+          echo "upstream_ahead_count=${UPSTREAM_AHEAD_COUNT}" >> $GITHUB_OUTPUT
+          echo "::notice::🔄 检测到上游更新 — 文件差异数: ${FILTERED_COUNT}"
+
+      # 4. 执行同步 — 文件更新 | 合并/强制
+      - name: Sync with upstream
+        if: ${{ steps.changes.outputs.has_changes == 'true' }}
+        run: |
+          set -euo pipefail
+          trap 'rc=$?; echo "::error::Sync failed (exit $rc) at line $LINENO"; exit $rc' ERR
+
+          UPSTREAM_BRANCH="${{ steps.changes.outputs.upstream_branch }}"
+          TARGET="${TARGET_BRANCH}"
+
+          mode_text=$([ "${SYNC_DEPTH}" = "0" ] && echo "历史同步" || echo "文件同步")
+          echo "::notice::⚙️ 同步模式: ${mode_text} (SYNC_DEPTH=${SYNC_DEPTH})"
+
+          UPSTREAM_REF="upstream/${UPSTREAM_BRANCH}"
+
+          commit_if_needed() {
+            commit_msg="$1"
+            success_msg="$2"
+            nochange_msg="$3"
+            if ! git diff-index --quiet HEAD --; then
+              git add -A
+              git commit -m "$commit_msg"
+              echo "::notice::${success_msg}"
+            else
+              echo "::notice::${nochange_msg}"
+            fi
+          }
+
+          # 1) 文件级同步（轻量）
+          file_sync() {
+            git diff -z --name-status -M HEAD.."${UPSTREAM_REF}" | {
+              while true; do
+                IFS= read -r -d '' status || break
+                if [[ "$status" == R* ]]; then
+                  IFS= read -r -d '' old || break
+                  IFS= read -r -d '' new || break
+                  if ! grep -x -F -q -- "$new" "${PROTECTED_LIST_FILE}" 2>/dev/null; then
+                    git checkout "${UPSTREAM_REF}" -- "$new" || true
+                  fi
+                  if ! grep -x -F -q -- "$old" "${PROTECTED_LIST_FILE}" 2>/dev/null; then
+                    git rm -f --ignore-unmatch "$old" 2>/dev/null || true
+                  fi
+                else
+                  IFS= read -r -d '' f || break
+                  case "$status" in
+                    D) ! grep -x -F -q -- "$f" "${PROTECTED_LIST_FILE}" 2>/dev/null && git rm -f --ignore-unmatch "$f" 2>/dev/null || true ;;
+                    *) ! grep -x -F -q -- "$f" "${PROTECTED_LIST_FILE}" 2>/dev/null && git checkout "${UPSTREAM_REF}" -- "$f" || true ;;
+                  esac
+                fi
+              done
+            }
+
+            commit_if_needed "Sync upstream ${UPSTREAM_BRANCH} (Update)" "✅ 文件同步成功" "✅ 文件同步: 无变更"
+          }
+
+          # 2) 合并或强制覆盖（重量）
+          merge_or_force() {
+            echo "::notice::🔄 尝试合并上游"
+            if git merge --no-ff --no-commit "${UPSTREAM_REF}"; then
+              commit_if_needed "Sync upstream ${UPSTREAM_BRANCH} (Merge)" "✅ 合并成功" "✅ 合并: 无实际变更"
+              PUSH_MODE="normal"
+              return
+            fi
+
+            echo "::warning::⚠️ 合并冲突，执行重置操作并保留受保护文件"
+
+            TMP_BAK="$(mktemp -d)"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              [ -f "$f" ] && mkdir -p "$TMP_BAK/$(dirname "$f")" && cp -a "$f" "$TMP_BAK/$f"
+            done < "${PROTECTED_LIST_FILE}"
+
+            git reset --hard "${UPSTREAM_REF}"
+            echo "::notice::✅ 强制覆盖完成"
+
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              if [ -f "$TMP_BAK/$f" ]; then
+                mkdir -p "$(dirname "$f")"
+                mv -f -- "$TMP_BAK/$f" "$f" 2>/dev/null || true
+              fi
+            done < "${PROTECTED_LIST_FILE}"
+
+            commit_if_needed "Sync upstream ${UPSTREAM_BRANCH} (Force)" "✅ 恢复受保护文件" "ℹ️ 无需恢复受保护文件"
+
+            rm -rf "$TMP_BAK" || true
+            PUSH_MODE="force"
+          }
+
+          # 主流程 => 0: 历史同步 (merge/force)；非0: 文件级同步
+          if [ "${SYNC_DEPTH}" = "0" ]; then
+            merge_or_force
+          else
+            file_sync
+          fi
+
+          # 推送（重试）
+          [ "${PUSH_MODE:-normal}" = "force" ] && push_args="--force-with-lease" || push_args=""
+          set +e
+          pushed=0; attempts=0
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            attempts=$i
+            if git push $push_args origin HEAD:"${TARGET}"; then
+              pushed=1
+              break
+            else
+              echo "::warning::git push failed on attempt ${i}"
+              [ $i -lt $MAX_ATTEMPTS ] && sleep $(( RETRY_BASE ** (i - 1) ))
+            fi
+          done
+          set -euo pipefail
+
+          if [ $pushed -eq 1 ]; then
+            echo "::notice::⏱️ 推送尝试 ${attempts}/${MAX_ATTEMPTS}（✅成功）"
+          else
+            echo "::error::⏱️ 推送尝试 ${MAX_ATTEMPTS}/${MAX_ATTEMPTS}（❌失败）"
+            exit 1
+          fi
+
+      # 5. 最终汇总
+      - name: Result summary
+        if: always()
+        env:
+          STATUS: ${{ job.status }}
+          HAS_CHANGES: ${{ steps.changes.outputs.has_changes }}
+          UPSTREAM: ${{ steps.upstream-info.outputs.upstream }}
+          UPSTREAM_BRANCH: ${{ steps.changes.outputs.upstream_branch }}
+          UPSTREAM_AHEAD_COUNT: ${{ steps.changes.outputs.upstream_ahead_count || '' }}
+          TARGET: ${{ env.TARGET_BRANCH }}
+        run: |
+          REPO_SLUG=$(echo "${UPSTREAM}" | sed -E 's#.*[:/]+([^/]+/[^/]+?)(\.git)?$#\1#')
+
+          echo "### 同步汇总" >> $GITHUB_STEP_SUMMARY
+          echo "**仓库**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**分支**: ${TARGET}" >> $GITHUB_STEP_SUMMARY
+          echo "**上游**: ${REPO_SLUG}@${UPSTREAM_BRANCH}" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${HAS_CHANGES}" = "true" ]; then
+            echo "**检测到上游更新**: 是" >> $GITHUB_STEP_SUMMARY
+            if [ "${SYNC_DEPTH}" = "0" ] && [ -n "${UPSTREAM_AHEAD_COUNT}" ]; then
+              echo "**上游领先提交数**: ${UPSTREAM_AHEAD_COUNT}" >> $GITHUB_STEP_SUMMARY || true
+            fi
+          else
+            echo "**检测到上游更新**: 否" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "**运行状态**: ${STATUS}" >> $GITHUB_STEP_SUMMARY
+
+          if git rev-parse --verify HEAD >/dev/null 2>&1; then
+            echo "**最新提交**: $(git --no-pager log -1 --pretty=format:'%h - %s (%ci)')" >> $GITHUB_STEP_SUMMARY || true
+          fi
+
+          echo "::notice::📌 同步汇总 — 状态: ${STATUS}，上游更新: ${HAS_CHANGES}"
